@@ -285,7 +285,7 @@ func setupMCPServer(libraryPath string) *mcp.Server {
 	}
 
 	// Create a server with search and book retrieval tools
-	server := mcp.NewServer(&mcp.Implementation{Name: "calibre-mcp", Version: "v1.0.3"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "calibre-mcp", Version: "v1.1.0"}, nil)
 
 	// Add search tool
 	mcp.AddTool(server, &mcp.Tool{
