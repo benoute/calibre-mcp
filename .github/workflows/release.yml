@@ -24,7 +24,7 @@ jobs:
       with:
         version: 0.15.2
 
-     - name: Build static binary
+    - name: Build static binary
        run: |
          export CGO_ENABLED=1
          TARGET=${{ matrix.arch == 'amd64' && 'x86_64-linux-musl' || 'aarch64-linux-musl' }}
