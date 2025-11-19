@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/rs/cors"
 )
 
 func parseFlags() (transport string, port string, libraryPath string) {
@@ -34,7 +35,27 @@ func main() {
 			func(*http.Request) *mcp.Server { return server },
 			nil,
 		)
-		log.Fatal(http.ListenAndServe(":"+port, handler))
+		// Create CORS handler
+		corsHandler := cors.New(cors.Options{
+			AllowOriginFunc: func(origin string) bool {
+				return true
+			},
+			AllowedMethods: []string{"GET", "POST", "OPTIONS"}, // OPTIONS for preflight
+			AllowedHeaders: []string{
+				"Content-Type",
+				"Authorization",
+				"Mcp-Session-Id",
+				"mcp-protocol-version",
+			},
+			ExposedHeaders:   []string{"Mcp-Session-Id"}, // Allow clients to read session ID
+			AllowCredentials: true,                       // If using auth cookies
+			MaxAge:           300,                        // Cache preflight for 5 minutes
+		}).Handler(handler)
+
+		log.Println("Starting MCP server on :" + port)
+		if err := http.ListenAndServe(":"+port, corsHandler); err != nil {
+			log.Fatal(err)
+		}
 	case "stdio":
 		if err := server.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 			log.Fatal(err)
