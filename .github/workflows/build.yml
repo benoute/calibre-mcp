@@ -1,0 +1,66 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Set up Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Build static binary
+      run: |
+        export CGO_ENABLED=1
+        TARGET=${{ matrix.arch == 'amd64' && 'x86_64-linux-musl' || 'aarch64-linux-musl' }}
+        export CC="zig cc -target $TARGET"
+        export CXX="zig c++ -target $TARGET"
+        go build -ldflags '-linkmode external -extldflags "-static"' -o calibre-mcp ./cmd/calibre-mcp
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: calibre-mcp-linux-${{ matrix.arch }}
+        path: calibre-mcp
+
+  build-macos:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-13
+            arch: amd64
+          - os: macos-14
+            arch: arm64
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+
+    - name: Build binary
+      run: go build -o calibre-mcp ./cmd/calibre-mcp
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: calibre-mcp-darwin-${{ matrix.arch }}
+        path: calibre-mcp
