@@ -59,8 +59,100 @@ type Manifest struct {
 }
 
 type Item struct {
-	Id   string `xml:"id,attr"`
-	Href string `xml:"href,attr"`
+	Id         string `xml:"id,attr"`
+	Href       string `xml:"href,attr"`
+	MediaType  string `xml:"media-type,attr"`
+	Properties string `xml:"properties,attr"`
+}
+
+// NCX structures for EPUB 2 TOC
+type NCX struct {
+	XMLName xml.Name `xml:"ncx"`
+	NavMap  NavMap   `xml:"navMap"`
+}
+
+type NavMap struct {
+	NavPoints []NavPoint `xml:"navPoint"`
+}
+
+type NavPoint struct {
+	NavLabel NavLabel `xml:"navLabel"`
+	Content  Content  `xml:"content"`
+}
+
+type NavLabel struct {
+	Text string `xml:"text"`
+}
+
+type Content struct {
+	Src string `xml:"src,attr"`
+}
+
+func extractText(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
+	}
+	var text strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		text.WriteString(extractText(c))
+	}
+	return text.String()
+}
+
+func parseNavTOC(htmlContent string) map[string]string {
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return nil
+	}
+
+	tocMap := make(map[string]string)
+
+	var findNav func(*html.Node)
+	findNav = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "nav" {
+			// Check if it has type="toc" or epub:type="toc"
+			for _, attr := range n.Attr {
+				if (attr.Key == "type" || attr.Key == "epub:type") && strings.Contains(attr.Val, "toc") {
+					// Found TOC nav, parse the ol/li/a
+					var parseList func(*html.Node)
+					parseList = func(ln *html.Node) {
+						if ln.Type == html.ElementNode && ln.Data == "a" {
+							href := ""
+							for _, a := range ln.Attr {
+								if a.Key == "href" {
+									href = a.Val
+									break
+								}
+							}
+							if href != "" {
+								// Strip fragment
+								if idx := strings.Index(href, "#"); idx != -1 {
+									href = href[:idx]
+								}
+								text := extractText(ln)
+								if text != "" {
+									tocMap[href] = text
+								}
+							}
+						}
+						for c := ln.FirstChild; c != nil; c = c.NextSibling {
+							parseList(c)
+						}
+					}
+					for c := n.FirstChild; c != nil; c = c.NextSibling {
+						parseList(c)
+					}
+					return
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			findNav(c)
+		}
+	}
+
+	findNav(doc)
+	return tocMap
 }
 
 func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) {
@@ -118,6 +210,45 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 		hrefMap[item.Id] = fullHref
 	}
 
+	// Build title map from TOC
+	titleMap := make(map[string]string)
+	for _, item := range pkg.Manifest.Items {
+		if strings.Contains(item.Properties, "nav") || item.MediaType == "application/x-dtbncx+xml" {
+			tocHref := filepath.Join(opfDir, item.Href)
+			tocFile, err := r.Open(tocHref)
+			if err == nil {
+				tocData, err := io.ReadAll(tocFile)
+				tocFile.Close()
+				if err == nil {
+					tocDir := filepath.Dir(tocHref)
+					if item.MediaType == "application/x-dtbncx+xml" {
+						// Parse NCX (src relative to OPF)
+						var ncx NCX
+						if xml.Unmarshal(tocData, &ncx) == nil {
+							for _, np := range ncx.NavMap.NavPoints {
+								src := np.Content.Src
+								// Strip fragment
+								if idx := strings.Index(src, "#"); idx != -1 {
+									src = src[:idx]
+								}
+								fullSrc := filepath.Join(opfDir, src)
+								titleMap[fullSrc] = np.NavLabel.Text
+							}
+						}
+					} else {
+						// Parse nav document (src relative to nav file)
+						navTitles := parseNavTOC(string(tocData))
+						for src, title := range navTitles {
+							fullSrc := filepath.Join(tocDir, src)
+							titleMap[fullSrc] = title
+						}
+					}
+				}
+			}
+			break // assume only one TOC
+		}
+	}
+
 	// Get chapters from spine
 	chapters := make([]Chapter, 0)
 	for i, itemref := range pkg.Spine.Itemrefs {
@@ -125,18 +256,13 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 		if !ok {
 			continue
 		}
-		title := fmt.Sprintf("Chapter %d", i+1)
-		// Try to extract title from the chapter file
-		chapterFile, err := r.Open(href)
-		if err == nil {
-			data, err := io.ReadAll(chapterFile)
-			chapterFile.Close()
-			if err == nil {
-				extractedTitle := extractTitleFromHTML(string(data))
-				if extractedTitle != "" {
-					title = extractedTitle
-				}
-			}
+		// Default to filename without extension
+		base := filepath.Base(href)
+		ext := filepath.Ext(base)
+		title := strings.TrimSuffix(base, ext)
+		// Override with TOC title if available
+		if tocTitle, exists := titleMap[href]; exists && tocTitle != "" {
+			title = tocTitle
 		}
 		chapters = append(chapters, Chapter{
 			Index: i,
@@ -262,67 +388,6 @@ func getEPUBPath(db *DB, libraryPath string, bookID int) (string, error) {
 	}
 
 	return filepath.Join(libraryPath, path, filename+".epub"), nil
-}
-
-func extractTitleFromHTML(htmlContent string) string {
-	doc, err := html.Parse(strings.NewReader(htmlContent))
-	if err != nil {
-		return ""
-	}
-
-	var extractText func(*html.Node) string
-	extractText = func(n *html.Node) string {
-		if n.Type == html.TextNode {
-			return n.Data
-		}
-		var text strings.Builder
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			text.WriteString(extractText(c))
-		}
-		return text.String()
-	}
-
-	// First, search for headings
-	var findHeading func(*html.Node) string
-	findHeading = func(n *html.Node) string {
-		if n.Type == html.ElementNode {
-			if n.Data == "h1" || n.Data == "h2" || n.Data == "h3" || n.Data == "h4" || n.Data == "h5" || n.Data == "h6" {
-				text := extractText(n)
-				if trimmed := strings.TrimSpace(text); trimmed != "" {
-					return trimmed
-				}
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if title := findHeading(c); title != "" {
-				return title
-			}
-		}
-		return ""
-	}
-
-	if heading := findHeading(doc); heading != "" {
-		return heading
-	}
-
-	// Fallback to title
-	var findTitle func(*html.Node) string
-	findTitle = func(n *html.Node) string {
-		if n.Type == html.ElementNode && n.Data == "title" {
-			text := extractText(n)
-			if trimmed := strings.TrimSpace(text); trimmed != "" {
-				return trimmed
-			}
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if title := findTitle(c); title != "" {
-				return title
-			}
-		}
-		return ""
-	}
-
-	return findTitle(doc)
 }
 
 func extractTextFromHTML(html string) string {
