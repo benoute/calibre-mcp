@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 type Chapter struct {
@@ -108,10 +110,12 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 		return nil, fmt.Errorf("failed to parse OPF: %w", err)
 	}
 
-	// Build href map
+	// Build href map, resolving relative to OPF directory
+	opfDir := filepath.Dir(opfPath)
 	hrefMap := make(map[string]string)
 	for _, item := range pkg.Manifest.Items {
-		hrefMap[item.Id] = item.Href
+		fullHref := filepath.Join(opfDir, item.Href)
+		hrefMap[item.Id] = fullHref
 	}
 
 	// Get chapters from spine
@@ -260,38 +264,65 @@ func getEPUBPath(db *DB, libraryPath string, bookID int) (string, error) {
 	return filepath.Join(libraryPath, path, filename+".epub"), nil
 }
 
-func extractTitleFromHTML(html string) string {
-	// Find <title> tag
-	start := strings.Index(html, "<title>")
-	if start == -1 {
-		// Try <title with attributes
-		start = strings.Index(html, "<title ")
-		if start == -1 {
-			return ""
-		}
-		// Find the closing >
-		endTag := strings.Index(html[start:], ">")
-		if endTag == -1 {
-			return ""
-		}
-		start += endTag + 1
-	} else {
-		start += 7
-	}
-
-	end := strings.Index(html[start:], "</title>")
-	if end == -1 {
+func extractTitleFromHTML(htmlContent string) string {
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
 		return ""
 	}
 
-	title := html[start : start+end]
-	// Decode basic entities
-	title = strings.ReplaceAll(title, "&amp;", "&")
-	title = strings.ReplaceAll(title, "&lt;", "<")
-	title = strings.ReplaceAll(title, "&gt;", ">")
-	title = strings.ReplaceAll(title, "&quot;", "\"")
-	title = strings.ReplaceAll(title, "&#39;", "'")
-	return strings.TrimSpace(title)
+	var extractText func(*html.Node) string
+	extractText = func(n *html.Node) string {
+		if n.Type == html.TextNode {
+			return n.Data
+		}
+		var text strings.Builder
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			text.WriteString(extractText(c))
+		}
+		return text.String()
+	}
+
+	// First, search for headings
+	var findHeading func(*html.Node) string
+	findHeading = func(n *html.Node) string {
+		if n.Type == html.ElementNode {
+			if n.Data == "h1" || n.Data == "h2" || n.Data == "h3" || n.Data == "h4" || n.Data == "h5" || n.Data == "h6" {
+				text := extractText(n)
+				if trimmed := strings.TrimSpace(text); trimmed != "" {
+					return trimmed
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if title := findHeading(c); title != "" {
+				return title
+			}
+		}
+		return ""
+	}
+
+	if heading := findHeading(doc); heading != "" {
+		return heading
+	}
+
+	// Fallback to title
+	var findTitle func(*html.Node) string
+	findTitle = func(n *html.Node) string {
+		if n.Type == html.ElementNode && n.Data == "title" {
+			text := extractText(n)
+			if trimmed := strings.TrimSpace(text); trimmed != "" {
+				return trimmed
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if title := findTitle(c); title != "" {
+				return title
+			}
+		}
+		return ""
+	}
+
+	return findTitle(doc)
 }
 
 func extractTextFromHTML(html string) string {
