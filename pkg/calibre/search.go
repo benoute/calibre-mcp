@@ -81,7 +81,7 @@ func Search(ctx context.Context, db *DB, query string, opts ...SearchOption) (*S
  		WHERE LOWER(b.title) LIKE ? OR LOWER(a.name) LIKE ? OR LOWER(t.name) LIKE ? OR LOWER(c.text) LIKE ?
  	`
 
-	args := []interface{}{searchQuery, searchQuery, searchQuery, searchQuery}
+	args := []any{searchQuery, searchQuery, searchQuery, searchQuery}
 
 	if options.Limit > 0 {
 		sqlQuery += " LIMIT ?"
@@ -98,7 +98,7 @@ func Search(ctx context.Context, db *DB, query string, opts ...SearchOption) (*S
 	}
 	defer rows.Close()
 
-	var books []Book
+	books := make([]Book, 0, options.Limit)
 	for rows.Next() {
 		var book Book
 		var series sql.NullString
