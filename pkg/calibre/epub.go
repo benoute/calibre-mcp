@@ -2,7 +2,9 @@ package calibre
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -41,6 +43,7 @@ type Rootfile struct {
 }
 
 type Package struct {
+	Version  string   `xml:"version,attr"`
 	XMLName  xml.Name `xml:"package"`
 	Manifest Manifest `xml:"manifest"`
 	Spine    Spine    `xml:"spine"`
@@ -99,60 +102,93 @@ func extractText(n *html.Node) string {
 	return text.String()
 }
 
-func parseNavTOC(htmlContent string) map[string]string {
-	doc, err := html.Parse(strings.NewReader(htmlContent))
+func parseNcxTOC(tocData []byte) (map[string]string, error) {
+	var ncx NCX
+	if err := xml.Unmarshal(tocData, &ncx); err != nil {
+		return nil, fmt.Errorf("failed to parse the NCX TOC: %w", err)
+	}
+
+	tocMap := make(map[string]string, len(ncx.NavMap.NavPoints))
+	for _, np := range ncx.NavMap.NavPoints {
+		src := np.Content.Src
+		// Strip fragment
+		if idx := strings.Index(src, "#"); idx != -1 {
+			src = src[:idx]
+		}
+		tocMap[src] = np.NavLabel.Text
+	}
+
+	return tocMap, nil
+}
+
+func parseNavTOC(tocData []byte) (map[string]string, error) {
+	doc, err := html.Parse(bytes.NewReader(tocData))
 	if err != nil {
+		return nil, fmt.Errorf("failed to parse the Nav TOC: %w", err)
+	}
+
+	// Find the nav item
+	var findNav func(n *html.Node) *html.Node
+	findNav = func(n *html.Node) *html.Node {
+		if n.Type == html.ElementNode && n.Data == "nav" {
+			// Check if it has type="toc" or epub:type="toc"
+			for _, attr := range n.Attr {
+				if (attr.Key != "type" && attr.Key != "epub:type") ||
+					!strings.Contains(attr.Val, "toc") {
+					continue
+				}
+				return n
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			nav := findNav(c)
+			if nav != nil {
+				return nav
+			}
+		}
 		return nil
+	}
+
+	nav := findNav(doc)
+	if nav == nil {
+		return nil, errors.New("could not find a nav item in the Nav TOC")
 	}
 
 	tocMap := make(map[string]string)
 
-	var findNav func(*html.Node)
-	findNav = func(n *html.Node) {
-		if n.Type == html.ElementNode && n.Data == "nav" {
-			// Check if it has type="toc" or epub:type="toc"
-			for _, attr := range n.Attr {
-				if (attr.Key == "type" || attr.Key == "epub:type") && strings.Contains(attr.Val, "toc") {
-					// Found TOC nav, parse the ol/li/a
-					var parseList func(*html.Node)
-					parseList = func(ln *html.Node) {
-						if ln.Type == html.ElementNode && ln.Data == "a" {
-							href := ""
-							for _, a := range ln.Attr {
-								if a.Key == "href" {
-									href = a.Val
-									break
-								}
-							}
-							if href != "" {
-								// Strip fragment
-								if idx := strings.Index(href, "#"); idx != -1 {
-									href = href[:idx]
-								}
-								text := extractText(ln)
-								if text != "" {
-									tocMap[href] = text
-								}
-							}
-						}
-						for c := ln.FirstChild; c != nil; c = c.NextSibling {
-							parseList(c)
-						}
-					}
-					for c := n.FirstChild; c != nil; c = c.NextSibling {
-						parseList(c)
-					}
-					return
+	// Found TOC nav, parse the ol/li/a
+	var parseList func(*html.Node)
+	parseList = func(ln *html.Node) {
+		if ln.Type == html.ElementNode && ln.Data == "a" {
+			var href string
+			for _, a := range ln.Attr {
+				if a.Key == "href" {
+					href = a.Val
+					break
+				}
+			}
+			if href != "" {
+				// Strip fragment
+				if idx := strings.Index(href, "#"); idx != -1 {
+					href = href[:idx]
+				}
+				text := extractText(ln)
+				if text != "" {
+					tocMap[href] = text
 				}
 			}
 		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			findNav(c)
+		for c := ln.FirstChild; c != nil; c = c.NextSibling {
+			parseList(c)
 		}
 	}
 
-	findNav(doc)
-	return tocMap
+	for c := nav.FirstChild; c != nil; c = c.NextSibling {
+		parseList(c)
+	}
+
+	return tocMap, nil
 }
 
 func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) {
@@ -202,55 +238,67 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 		return nil, fmt.Errorf("failed to parse OPF: %w", err)
 	}
 
+	// TOC item to find
+	var tocItem *Item
+
 	// Build href map, resolving relative to OPF directory
 	opfDir := filepath.Dir(opfPath)
 	hrefMap := make(map[string]string)
 	for _, item := range pkg.Manifest.Items {
 		fullHref := filepath.Join(opfDir, item.Href)
 		hrefMap[item.Id] = fullHref
+
+		// Look for "nav" or "ncx"
+		if strings.Contains(item.Properties, "nav") ||
+			item.MediaType == "application/x-dtbncx+xml" {
+			tocItem = &item
+		}
+	}
+
+	if tocItem == nil {
+		return nil, errors.New("no TOC found")
 	}
 
 	// Build title map from TOC
 	titleMap := make(map[string]string)
-	for _, item := range pkg.Manifest.Items {
-		if strings.Contains(item.Properties, "nav") || item.MediaType == "application/x-dtbncx+xml" {
-			tocHref := filepath.Join(opfDir, item.Href)
-			tocFile, err := r.Open(tocHref)
-			if err == nil {
-				tocData, err := io.ReadAll(tocFile)
-				tocFile.Close()
-				if err == nil {
-					tocDir := filepath.Dir(tocHref)
-					if item.MediaType == "application/x-dtbncx+xml" {
-						// Parse NCX (src relative to OPF)
-						var ncx NCX
-						if xml.Unmarshal(tocData, &ncx) == nil {
-							for _, np := range ncx.NavMap.NavPoints {
-								src := np.Content.Src
-								// Strip fragment
-								if idx := strings.Index(src, "#"); idx != -1 {
-									src = src[:idx]
-								}
-								fullSrc := filepath.Join(opfDir, src)
-								titleMap[fullSrc] = np.NavLabel.Text
-							}
-						}
-					} else {
-						// Parse nav document (src relative to nav file)
-						navTitles := parseNavTOC(string(tocData))
-						for src, title := range navTitles {
-							fullSrc := filepath.Join(tocDir, src)
-							titleMap[fullSrc] = title
-						}
-					}
-				}
-			}
-			break // assume only one TOC
-		}
+
+	tocHref := filepath.Join(opfDir, tocItem.Href)
+	tocDir := filepath.Dir(tocHref)
+
+	tocFile, err := r.Open(tocHref)
+	if err != nil {
+		return nil, fmt.Errorf("could not open TOC %s, %w", tocHref, err)
+	}
+
+	tocData, err := io.ReadAll(tocFile)
+	_ = tocFile.Close()
+	if err != nil {
+		return nil, fmt.Errorf("could not read TOC %s, %w", tocHref, err)
+	}
+
+	var tocMap map[string]string
+	var tocErr error
+
+	if tocItem.MediaType == "application/x-dtbncx+xml" {
+		// EPUB v2: parse NCX (src relative to OPF)
+		tocMap, tocErr = parseNcxTOC(tocData)
+	} else {
+		// EPUB v3: parse nav document (src relative to nav file)
+		tocMap, tocErr = parseNavTOC(tocData)
+	}
+
+	if tocErr != nil {
+		return nil, tocErr
+	}
+
+	// Resolve relative path to absolute
+	for src, title := range tocMap {
+		fullSrc := filepath.Join(tocDir, src)
+		titleMap[fullSrc] = title
 	}
 
 	// Get chapters from spine
-	chapters := make([]Chapter, 0)
+	chapters := make([]Chapter, 0, len(pkg.Spine.Itemrefs))
 	for i, itemref := range pkg.Spine.Itemrefs {
 		href, ok := hrefMap[itemref.Idref]
 		if !ok {
@@ -260,10 +308,12 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 		base := filepath.Base(href)
 		ext := filepath.Ext(base)
 		title := strings.TrimSuffix(base, ext)
+
 		// Override with TOC title if available
 		if tocTitle, exists := titleMap[href]; exists && tocTitle != "" {
 			title = tocTitle
 		}
+
 		chapters = append(chapters, Chapter{
 			Index: i,
 			Title: title,
@@ -274,7 +324,12 @@ func GetEPUBChapters(db *DB, libraryPath string, bookID int) ([]Chapter, error) 
 	return chapters, nil
 }
 
-func GetEPUBChapterContent(db *DB, libraryPath string, bookID int, chapterIndex int) (string, error) {
+func GetEPUBChapterContent(
+	db *DB,
+	libraryPath string,
+	bookID int,
+	chapterIndex int,
+) (string, error) {
 	epubPath, err := getEPUBPath(db, libraryPath, bookID)
 	if err != nil {
 		return "", err
@@ -315,7 +370,14 @@ func GetEPUBChapterContent(db *DB, libraryPath string, bookID int, chapterIndex 
 	return content, nil
 }
 
-func SearchEPUBContent(db *DB, libraryPath string, bookID int, query string, limit int, offset int) ([]SearchMatch, error) {
+func SearchEPUBContent(
+	db *DB,
+	libraryPath string,
+	bookID int,
+	query string,
+	limit int,
+	offset int,
+) ([]SearchMatch, error) {
 	key := fmt.Sprintf("%d:%s", bookID, query)
 	var matches []SearchMatch
 
@@ -347,7 +409,8 @@ func SearchEPUBContent(db *DB, libraryPath string, bookID int, query string, lim
 					pos := strings.Index(paraLower, queryLower)
 					if pos != -1 {
 						// Highlight the match in the paragraph
-						snippet := para[:pos] + "**" + para[pos:pos+len(query)] + "**" + para[pos+len(query):]
+						snippet := para[:pos] + "**" + para[pos:pos+len(query)] +
+							"**" + para[pos+len(query):]
 						matches = append(matches, SearchMatch{
 							ChapterIndex: chapter.Index,
 							ChapterTitle: chapter.Title,
@@ -376,6 +439,7 @@ func SearchEPUBContent(db *DB, libraryPath string, bookID int, query string, lim
 
 func getEPUBPath(db *DB, libraryPath string, bookID int) (string, error) {
 	var path, filename string
+
 	err := db.QueryRow(`
 		SELECT b.path, d.name
 		FROM books b
@@ -383,6 +447,7 @@ func getEPUBPath(db *DB, libraryPath string, bookID int) (string, error) {
 		WHERE b.id = ? AND d.format = 'EPUB'
 		LIMIT 1
 	`, bookID).Scan(&path, &filename)
+
 	if err != nil {
 		return "", fmt.Errorf("EPUB not found for book %d: %w", bookID, err)
 	}
